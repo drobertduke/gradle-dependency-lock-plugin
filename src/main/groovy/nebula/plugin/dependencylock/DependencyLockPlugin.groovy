@@ -16,6 +16,7 @@
 package nebula.plugin.dependencylock
 
 import groovy.json.JsonSlurper
+import groovy.transform.TailRecursive
 import nebula.plugin.dependencylock.tasks.CommitLockTask
 import nebula.plugin.dependencylock.tasks.GenerateLockTask
 import nebula.plugin.dependencylock.tasks.SaveLockTask
@@ -41,6 +42,38 @@ class DependencyLockPlugin implements Plugin<Project> {
     public static final String UPDATE_GLOBAL_LOCK_TASK_NAME = 'updateGlobalLock'
     public static final String GENERATE_LOCK_TASK_NAME = 'generateLock'
     public static final String UPDATE_LOCK_TASK_NAME = 'updateLock'
+    private static enum OVERRIDE_TYPE { SIMPLE, AFFECT_TRANSITIVES }
+    private static enum OVERRIDE_PARAMETERS {
+        OVERRIDE("override"),
+        OVERRIDE_FILE("overrideFile"),
+        OVERRIDE_AND_IGNORE_TRANSITIVE_LOCKS("overrideAndIgnoreTransitiveLocks")
+
+        final String value
+        OVERRIDE_PARAMETERS(String value) { this.value = value}
+        String toString() { value }
+    }
+
+    /**
+     * Finds dependencies recursively for a set of parents
+     * @param Map dependencies
+     * @param List parents
+     * @param List children
+     * @return A list of descendants for the given parents
+     */
+    @TailRecursive
+    public static List descendants(dependencies, parents, children = []) {
+        if (parents.size() == 0) {
+            return children
+        }
+        final newChildren = parents.collectMany { parent ->
+            dependencies.findAll { key, value ->
+                value.transitive?.contains(parent.toString())
+            }.keySet()
+        }
+        descendants(dependencies, newChildren, children + newChildren)
+    }
+
+
     Project project
 
     @Override
@@ -54,7 +87,8 @@ class DependencyLockPlugin implements Plugin<Project> {
             commitExtension = project.rootProject.extensions.create('commitDependencyLock', DependencyLockCommitExtension)
         }
 
-        Map overrides = loadOverrides()
+        final Map overridesByType = loadOverrides()
+        final Map overrides = combineOverrides(overridesByType)
 
         GenerateLockTask genLockTask = project.tasks.create(GENERATE_LOCK_TASK_NAME, GenerateLockTask)
         configureLockTask(genLockTask, clLockFileName, extension, overrides)
@@ -95,10 +129,10 @@ class DependencyLockPlugin implements Plugin<Project> {
         def lockAfterEvaluating = project.hasProperty('dependencyLock.lockAfterEvaluating') ? Boolean.parseBoolean(project['dependencyLock.lockAfterEvaluating']) : extension.lockAfterEvaluating
         if (lockAfterEvaluating) {
             logger.info('Applying dependency lock in afterEvaluate block')
-            project.afterEvaluate { applyLockToResolutionStrategy(extension, overrides, globalLockFileName, clLockFileName) }
+            project.afterEvaluate { applyLockToResolutionStrategy(extension, overridesByType, globalLockFileName, clLockFileName) }
         } else {
             logger.info('Applying dependency lock as is (outside afterEvaluate block)')
-            applyLockToResolutionStrategy(extension, overrides, globalLockFileName, clLockFileName)
+            applyLockToResolutionStrategy(extension, overridesByType, globalLockFileName, clLockFileName)
         }
 
         project.gradle.taskGraph.whenReady { taskGraph ->
@@ -117,7 +151,7 @@ class DependencyLockPlugin implements Plugin<Project> {
         }
     }
 
-    private void applyLockToResolutionStrategy(DependencyLockExtension extension, Map overrides, String globalLockFileName, String clLockFileName) {
+    private void applyLockToResolutionStrategy(DependencyLockExtension extension, Map overridesByType, String globalLockFileName, String clLockFileName) {
         if (extension.configurationNames.empty) {
             extension.configurationNames = project.configurations.collect { it.name }
         }
@@ -133,9 +167,9 @@ class DependencyLockPlugin implements Plugin<Project> {
         def taskNames = project.gradle.startParameter.taskNames
 
         if (dependenciesLock.exists() && !shouldIgnoreDependencyLock() && !hasGenerationTask(taskNames)) {
-            applyLock(dependenciesLock, overrides)
+            applyLock(dependenciesLock, overridesByType, extension)
         } else if (!shouldIgnoreDependencyLock()) {
-            applyOverrides(overrides)
+            applyOverrides(combineOverrides(overridesByType))
         }
     }
 
@@ -271,12 +305,15 @@ class DependencyLockPlugin implements Plugin<Project> {
         lockTask
     }
 
+    private Boolean shouldIncludeTransitives(DependencyLockExtension extension) {
+        project.hasProperty('dependencyLock.includeTransitives') ?
+                Boolean.parseBoolean(project['dependencyLock.includeTransitives']) : extension.includeTransitives
+    }
+
     private void setupLockConventionMapping(GenerateLockTask task, DependencyLockExtension extension, Map overrideMap) {
         task.conventionMapping.with {
             skippedDependencies = { extension.skippedDependencies }
-            includeTransitives = {
-                project.hasProperty('dependencyLock.includeTransitives') ? Boolean.parseBoolean(project['dependencyLock.includeTransitives']) : extension.includeTransitives
-            }
+            includeTransitives = { shouldIncludeTransitives(extension) }
             filter = { extension.dependencyFilter }
             overrides = { overrideMap }
         }
@@ -360,41 +397,35 @@ class DependencyLockPlugin implements Plugin<Project> {
         }
     }
 
-    void applyLock(File dependenciesLock, Map overrides) {
+    void applyLock(File dependenciesLock, Map overridesByType, DependencyLockExtension extension) {
         logger.info("Using ${dependenciesLock.name} to lock dependencies")
         def locks = loadLock(dependenciesLock)
 
-        def isDeprecatedFormat = locks.every { it.key ==~ /[^:]+:.+/ } // in the old format, all first level props were groupId:artifactId
-        if (isDeprecatedFormat) {
-            logger.warn("${dependenciesLock.name} is using a deprecated lock format. Support for this format may be removed in future versions.")
-        }
+        warnIfDeprecated(locks, dependenciesLock.name)
 
         project.configurations.all({ Configuration conf ->
             // In the old format of the lock file, there was only one locked setting. In that case, apply it on all configurations.
             // In the new format, apply _global_ to all configurations or use the config name
-            def deps = isDeprecatedFormat ? locks : locks[GLOBAL_LOCK_CONFIG] ?: locks[conf.name]
+            def deps = isDeprecatedFormat(locks) ? locks : locks[GLOBAL_LOCK_CONFIG] ?: locks[conf.name]
             if (deps) {
                 // Non-project locks are the top-level dependencies, and possibly transitive thereof, of this project which are
                 // locked by the lock file. There may also be dependencies on other projects. These are not captured here.
                 def nonProjectLocks = deps.findAll { it.value?.locked }
 
-                // Override locks from the file with any of the user specified manual overrides.
-                def lockForces = nonProjectLocks.collect {
-                    overrides.containsKey(it.key) ? "${it.key}:${overrides[it.key]}" : "${it.key}:${it.value.locked}"
-                }
+                // If overrideAndIgnoreTransitiveLocks is used, we exclude any locks on transitives of the overridden
+                // packages.
+                final transitivesToIgnore = descendants(deps, overridesByType[OVERRIDE_TYPE.AFFECT_TRANSITIVES].keySet())
 
-                // If the user specifies an override that does not exist in the lock file, force that dependency anyway.
-                def unusedOverrides = overrides.findAll { !locks.containsKey(it.key) }.collect {
-                    "${it.key}:${it.value}"
-                }
+                final locksFromFile = nonProjectLocks.collectEntries { [it.key, it.value.locked] }
+                final fileLocksRespected = locksFromFile.findAll { !transitivesToIgnore.contains(it.key) }
 
-                lockForces.addAll(unusedOverrides)
-                logger.debug('lockForces: {}', lockForces)
+                final overrides = combineOverrides(overridesByType)
+                final locksWithOverrides = fileLocksRespected + overrides
 
-                // Create the dependencies explicitly to avoid doing that implicitly for every configuration
-                lockForces = lockForces.collect { dep -> project.dependencies.create(dep) }
+                logger.debug('lockForces: {}', locksWithOverrides)
+
                 resolutionStrategy {
-                    force lockForces.toArray()
+                    force locksWithOverrides.collect { key, value -> "${key}:${value}" }
                 }
             }
         })
@@ -410,35 +441,93 @@ class DependencyLockPlugin implements Plugin<Project> {
         }
     }
 
+    private void warnIfDeprecated(final Object lockFileContents, final String lockFileName) {
+        if (isDeprecatedFormat(lockFileContents)) {
+            logger.warn("The override file ${lockFileName} is using a deprecated format. Support for this format may be removed in future versions.")
+        }
+    }
+
+    private Boolean isDeprecatedFormat(final Object lockFileContents) {
+        // Which method is correct?
+        //lockFileContents.every { it.key ==~ /[^:]+:.+/ } // in the old format, all first level props were groupId:artifactId
+        lockFileContents.any { it.value.getClass() != String && it.value.locked }
+    }
+
+    /**
+     * Parses any command line overrides and returns them with the override type.
+     * @return A map of override type to the package/version overrides of that type.
+     */
     private Map loadOverrides() {
         // Overrides are dependencies that trump the lock file.
-        Map overrides = [:]
         if (shouldIgnoreDependencyLock()) {
-            return overrides
+            return [(OVERRIDE_TYPE.AFFECT_TRANSITIVES): [:], (OVERRIDE_TYPE.SIMPLE): [:]]
         }
+        final Map overridesByParameter = parseOverrideParameters()
+        // Merges the two maps by starting with any overrides from 'overrideFile' and adding overrides from 'override'.
+        // Command line 'override' wins in the case of conflicts.
+        final Map simpleOverrides = overridesByParameter[OVERRIDE_PARAMETERS.OVERRIDE_FILE] +
+                overridesByParameter[OVERRIDE_PARAMETERS.OVERRIDE]
+        final Map overridesByType = [
+                (OVERRIDE_TYPE.AFFECT_TRANSITIVES):
+                        overridesByParameter[OVERRIDE_PARAMETERS.OVERRIDE_AND_IGNORE_TRANSITIVE_LOCKS],
+                (OVERRIDE_TYPE.SIMPLE): simpleOverrides
+        ]
+        logger.debug "Overrides loaded: ${overridesByType}"
+        return overridesByType
+    }
 
-        // Load overrides from a file if the user has specified one via a property.
-        if (project.hasProperty('dependencyLock.overrideFile')) {
-            File dependenciesLock = new File(project.rootDir, project['dependencyLock.overrideFile'])
-            def lockOverride = loadLock(dependenciesLock)
-            def isDeprecatedFormat = lockOverride.any { it.value.getClass() != String && it.value.locked } // the old lock override files specified the version to override under the "locked" property
-            if (isDeprecatedFormat) {
-                logger.warn("The override file ${dependenciesLock.name} is using a deprecated format. Support for this format may be removed in future versions.")
+    /**
+     * Takes a string of comma delimited overrides from the command line and parses them.
+     * @param overrideTargets
+     * @return A map of package to version (or null)
+     */
+    private Map parseOverrideTargets(final String overrideTargets) {
+        overrideTargets?.tokenize(',')?.collectEntries {
+            def (group, artifact, version) = it.tokenize(':')
+            ["${group}:${artifact}", version]
+        }
+    }
+
+    /**
+     * Parses the three types of command line overrides parameters
+     * @return A map of the override parameter type to the package/version overrides from that parameter.
+     */
+    private Map parseOverrideParameters() {
+        OVERRIDE_PARAMETERS.values().collectEntries { parameterType ->
+            final String parameterName = "dependencyLock.${parameterType}"
+            def value = [:]
+            if (project.hasProperty(parameterName)) {
+                final String argument = project[parameterName]
+                if (!argument.is(null)) {
+                    switch(parameterType) {
+                        case OVERRIDE_PARAMETERS.OVERRIDE:
+                            value = parseOverrideTargets(argument)
+                            break
+                        case OVERRIDE_PARAMETERS.OVERRIDE_AND_IGNORE_TRANSITIVE_LOCKS:
+                            value = parseOverrideTargets(argument)
+                            break
+                        case OVERRIDE_PARAMETERS.OVERRIDE_FILE:
+                            final overrideFile = new File(project.rootDir, argument)
+                            final locks = loadLock(overrideFile)
+                            warnIfDeprecated(locks, overrideFile.name)
+                            locks.each {
+                                value[it.key] = isDeprecatedFormat(locks) ? it.value.locked : it.value
+                            }
+                            break
+                    }
+                }
             }
-            lockOverride.each { overrides[it.key] = isDeprecatedFormat ? it.value.locked : it.value }
-            logger.debug "Override file loaded: ${project['dependencyLock.overrideFile']}"
+            [parameterType, value]
         }
+    }
 
-        // Allow the user to specify overrides via a property as well.
-        if (project.hasProperty('dependencyLock.override')) {
-            project['dependencyLock.override'].tokenize(',').each {
-                def (group, artifact, version) = it.tokenize(':')
-                overrides["${group}:${artifact}".toString()] = version
-                logger.debug "Override added for: ${it}"
-            }
-        }
-
-        return overrides
+    /**
+     * Takes a map of overrides by type and flattens it, discarding the override type information.
+     * @param overridesByType
+     * @return A map of package to version
+     */
+    private Map combineOverrides(final Map overridesByType) {
+        overridesByType[OVERRIDE_TYPE.SIMPLE] + overridesByType[OVERRIDE_TYPE.AFFECT_TRANSITIVES]
     }
 
     private loadLock(File lock) {

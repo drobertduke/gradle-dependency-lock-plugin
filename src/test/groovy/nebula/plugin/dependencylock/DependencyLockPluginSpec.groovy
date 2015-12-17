@@ -158,6 +158,64 @@ class DependencyLockPluginSpec extends ProjectSpec {
         foo.moduleVersion == '1.0.0'
     }
 
+    def 'command line overrideAndIgnoreTransitiveLocks of a dependency updates transitive versions'() {
+        def dependenciesLock = new File(projectDir, 'dependencies.lock')
+        dependenciesLock << '''\
+            {
+                "compile": {
+                    "test.example:bar": {
+                        "locked": "1.0.0",
+                        "requested": "1.0.0",
+                    },
+                    "test.example:baz": {
+                        "locked": "1.0.0",
+                        "requested": "1.0.0",
+                        "transitive": [ "test.example:bar" ]
+                    },
+                }
+            }
+        '''.stripIndent()
+
+        project.apply plugin: 'java'
+        project.repositories { maven { url Fixture.repo } }
+        project.dependencies {
+            compile 'test.example:bar:1.0.0'
+        }
+
+        project.ext.set('dependencyLock.overrideAndIgnoreTransitiveLocks', 'test.example:bar:1.0.1')
+
+        when:
+        project.apply plugin: pluginName
+        triggerAfterEvaluate()
+
+        then:
+        def resolved = project.configurations.compile.resolvedConfiguration
+        def bar = resolved.firstLevelModuleDependencies.find { it.moduleName == 'bar' }
+        def baz = bar.getChildren().find { it.moduleName == 'baz' }
+        bar.moduleVersion == '1.0.1'
+        baz.moduleVersion == '3.0.0'
+    }
+
+    def 'descendants returns children recursively for a list of parents'() {
+        final grandparent = "test.example:bar"
+        final parent = "test.example:baz"
+        final child1 = "test.example:foo"
+        final child2 = "test.example:cat"
+        final dependencies = [
+            grandparent: [],
+            parent: [
+                "transitive": [ grandparent ]
+            ],
+            child1: [
+                "transitive": [ parent ]
+            ],
+            child2: [
+                    "transitive": [ parent ]
+            ]
+        ]
+        DependencyLockPlugin.descendants(dependencies, [grandparent]) == [parent, child1, child2]
+    }
+
     def 'command line override of a dependency'() {
         stockTestSetup()
 

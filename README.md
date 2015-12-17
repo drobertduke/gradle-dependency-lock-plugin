@@ -42,7 +42,7 @@ If newer than gradle 2.1 you may use
 
 ### Tasks Provided
 
-Command line overrides via `-PdependencyLock.override` or `-PdependencyLock.overrideFile` will apply.
+Command line overrides via `-PdependencyLock.override` or `-PdependencyLock.overrideFile` or `-PdependencyLock.overrideAndIgnoreTransitiveLocks` will apply.
 
 * generateLock - Generate a lock file into the build directory. Any existing `dependency.lock` file will be ignored.
 * updateLock - Update dependencies from the lock file into the build directory. By default, this task does the same thing as the `generateLock` task. This task also exposes an option `--dependencies` allowing the user to specify a comma-separated list, in the format `<group>:<artifact>`, of dependencies to update.
@@ -179,6 +179,13 @@ Allows the user to specify overrides to libraries on the command line. This over
 or to override multiple libraries
 
     ./gradlew -PdependencyLock.override=group0:artifact0:version0,group1:artifact1:version1 <tasks>
+
+*dependencyLock.overrideAndIgnoreTransitiveLocks*
+
+In addition to overriding the libraries specified, version locks on transitive dependencies of the overridden
+ libraries will be ignored.  This allows overrides to propagate through transitive dependency resolution.
+
+    ./gradlew -PdependencyLock.overrideAndIgnoreTransitiveLocks=group0:artifact0:version0,group1:artifact1:version1 <tasks>
 
 *commitDependencyLock.message*
 
