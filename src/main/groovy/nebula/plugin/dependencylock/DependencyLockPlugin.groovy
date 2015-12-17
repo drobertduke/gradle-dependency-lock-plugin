@@ -133,7 +133,7 @@ class DependencyLockPlugin implements Plugin<Project> {
         def taskNames = project.gradle.startParameter.taskNames
 
         if (dependenciesLock.exists() && !shouldIgnoreDependencyLock() && !hasGenerationTask(taskNames)) {
-            applyLock(dependenciesLock, overrides)
+            applyLock(dependenciesLock, overrides, extension)
         } else if (!shouldIgnoreDependencyLock()) {
             applyOverrides(overrides)
         }
@@ -271,12 +271,15 @@ class DependencyLockPlugin implements Plugin<Project> {
         lockTask
     }
 
+    private Boolean shouldIncludeTransitives(DependencyLockExtension extension) {
+        project.hasProperty('dependencyLock.includeTransitives') ?
+                Boolean.parseBoolean(project['dependencyLock.includeTransitives']) : extension.includeTransitives
+    }
+
     private void setupLockConventionMapping(GenerateLockTask task, DependencyLockExtension extension, Map overrideMap) {
         task.conventionMapping.with {
             skippedDependencies = { extension.skippedDependencies }
-            includeTransitives = {
-                project.hasProperty('dependencyLock.includeTransitives') ? Boolean.parseBoolean(project['dependencyLock.includeTransitives']) : extension.includeTransitives
-            }
+            includeTransitives = { shouldIncludeTransitives(extension) }
             filter = { extension.dependencyFilter }
             overrides = { overrideMap }
         }
@@ -360,7 +363,7 @@ class DependencyLockPlugin implements Plugin<Project> {
         }
     }
 
-    void applyLock(File dependenciesLock, Map overrides) {
+    void applyLock(File dependenciesLock, Map overrides, DependencyLockExtension extension) {
         logger.info("Using ${dependenciesLock.name} to lock dependencies")
         def locks = loadLock(dependenciesLock)
 
@@ -378,6 +381,14 @@ class DependencyLockPlugin implements Plugin<Project> {
                 // locked by the lock file. There may also be dependencies on other projects. These are not captured here.
                 def nonProjectLocks = deps.findAll { it.value?.locked }
 
+                if (shouldIncludeTransitives(extension)) {
+                    final transitivesOfOverrides = overrides.keySet().collectMany {
+                        locks[conf.name][it]?.firstLevelTransitive ?: locks[conf.name][it]?.transitive ?: []
+                    }
+                    nonProjectLocks = nonProjectLocks.findAll {
+                        !transitivesOfOverrides.contains(it.key)
+                    }
+                }
                 // Override locks from the file with any of the user specified manual overrides.
                 def lockForces = nonProjectLocks.collect {
                     overrides.containsKey(it.key) ? "${it.key}:${overrides[it.key]}" : "${it.key}:${it.value.locked}"

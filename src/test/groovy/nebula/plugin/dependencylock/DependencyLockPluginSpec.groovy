@@ -158,6 +158,84 @@ class DependencyLockPluginSpec extends ProjectSpec {
         foo.moduleVersion == '1.0.0'
     }
 
+    def 'command line override of a dependency with includeTransitives updates transitive versions'() {
+        def dependenciesLock = new File(projectDir, 'dependencies.lock')
+        dependenciesLock << '''\
+            {
+                "compile": {
+                    "test.example:bar": {
+                        "locked": "1.0.0",
+                        "requested": "1.0.0",
+                        "transitive": [ "test.example:foo" ]
+                    },
+                    "test.example:foo": {
+                        "locked": "1.0.0",
+                        "requested": "1.0.0"
+                    }
+                }
+            }
+        '''.stripIndent()
+
+        project.apply plugin: 'java'
+        project.repositories { maven { url Fixture.repo } }
+        project.dependencies {
+            compile 'test.example:bar:1.1.0'
+        }
+
+        project.ext.set('dependencyLock.override', 'test.example:bar:1.1.0')
+        project.ext.set('dependencyLock.includeTransitives', 'true')
+
+        when:
+        project.apply plugin: pluginName
+        triggerAfterEvaluate()
+
+        then:
+        def resolved = project.configurations.compile.resolvedConfiguration
+        def bar = resolved.firstLevelModuleDependencies.find { it.moduleName == 'bar' }
+        def foo = bar.getChildren().find { it.moduleName == 'foo' }
+        bar.moduleVersion == '1.1.0'
+        foo.moduleVersion == '1.0.1'
+    }
+
+    def 'command line override of a dependency with includeTransitives updates firstLevelTransitive versions'() {
+        def dependenciesLock = new File(projectDir, 'dependencies.lock')
+        dependenciesLock << '''\
+            {
+                "compile": {
+                    "test.example:bar": {
+                        "locked": "1.0.0",
+                        "requested": "1.0.0",
+                        "firstLevelTransitive": [ "test.example:foo" ]
+                    },
+                    "test.example:foo": {
+                        "locked": "1.0.0",
+                        "requested": "1.0.0"
+                    }
+                }
+            }
+        '''.stripIndent()
+
+        project.apply plugin: 'java'
+        project.repositories { maven { url Fixture.repo } }
+        project.dependencies {
+            compile 'test.example:bar:1.1.0'
+        }
+
+        project.ext.set('dependencyLock.override', 'test.example:bar:1.1.0')
+        project.ext.set('dependencyLock.includeTransitives', 'true')
+
+        when:
+        project.apply plugin: pluginName
+        triggerAfterEvaluate()
+
+        then:
+        def resolved = project.configurations.compile.resolvedConfiguration
+        def bar = resolved.firstLevelModuleDependencies.find { it.moduleName == 'bar' }
+        def foo = bar.getChildren().find { it.moduleName == 'foo' }
+        bar.moduleVersion == '1.1.0'
+        foo.moduleVersion == '1.0.1'
+    }
+
     def 'command line override of a dependency'() {
         stockTestSetup()
 
